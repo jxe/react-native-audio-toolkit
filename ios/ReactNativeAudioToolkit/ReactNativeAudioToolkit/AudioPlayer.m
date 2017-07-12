@@ -154,12 +154,29 @@ RCT_EXPORT_METHOD(prepare:(nonnull NSNumber*)playerId
     
     // Prepare the player
     // Wait until player is ready
-    while (player.status == AVPlayerStatusUnknown) {
+    while (player.currentItem.status == AVPlayerStatusUnknown) {
+        [NSThread sleepForTimeInterval:0.01f];
+    }
+    
+    //make sure loadedTimeRanges is not null
+    while (player.currentItem.loadedTimeRanges.firstObject == nil){
+        [NSThread sleepForTimeInterval:0.01f];
+    }
+    
+    //wait until 10 seconds are buffered then play
+    player.currentItem.preferredForwardBufferDuration = 500;
+    Float64 durationSeconds = 0;
+    while (durationSeconds < 10){
+        NSValue *val = player.currentItem.loadedTimeRanges.firstObject;
+        CMTimeRange timeRange;
+        [val getValue:&timeRange];
+        durationSeconds = CMTimeGetSeconds(timeRange.duration);
         [NSThread sleepForTimeInterval:0.01f];
     }
     
     // Callback when ready / failed
-    if (player.status == AVPlayerStatusReadyToPlay) {
+    if (player.currentItem.status == AVPlayerStatusReadyToPlay) {
+        player.automaticallyWaitsToMinimizeStalling = false;
         callback(@[[NSNull null]]);
     } else {
         NSDictionary* dict = [Helpers errObjWithCode:@"preparefail"
@@ -167,10 +184,10 @@ RCT_EXPORT_METHOD(prepare:(nonnull NSNumber*)playerId
         
         if (player.autoDestroy) {
             [self destroyPlayerWithId:playerId];
-        }
+        }   
         
         callback(@[dict]);
-    }
+    }   
 }
 
 RCT_EXPORT_METHOD(destroy:(nonnull NSNumber*)playerId withCallback:(RCTResponseSenderBlock)callback) {
