@@ -17,17 +17,30 @@
 #import <AVFoundation/AVPlayerItem.h>
 #import <AVFoundation/AVAsset.h>
 
-
 @interface AudioPlayer ()
 
 @property (nonatomic, strong) NSMutableDictionary *playerPool;
+@property (nonatomic, strong) NSNumber *lastPlayerId;
 
 @end
 
 @implementation AudioPlayer
 
+
 @synthesize bridge = _bridge;
 
+
+- (id) init {
+    self = [super init];
+    if (self != nil) {
+        // Setting session and check if we got interrupted
+        AVAudioSession *session = [AVAudioSession sharedInstance];
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(audioSessionInterruptionNotification:)
+                                                     name:AVAudioSessionInterruptionNotification
+                                                   object:session];    }
+    return self;
+}
 
 -(NSMutableDictionary*) playerPool {
     if (!_playerPool) {
@@ -44,12 +57,27 @@
     return [[_playerPool allKeysForObject:player] firstObject];
 }
 
+
+-(void) setLastPlayerId:(nonnull NSNumber*)id {
+    
+    if (!_lastPlayerId) {
+        _lastPlayerId = [NSNumber new];
+    }
+    
+    _lastPlayerId = id;
+}
+
+-(NSNumber*) getLastPlayerId {
+    return _lastPlayerId;
+}
+
 - (void)dealloc {
     for (ReactPlayer *player in [self playerPool]) {
         NSNumber *playerId = [self keyForPlayer:player];
         [self destroyPlayerWithId:playerId];
     }
     _playerPool = nil;
+
 }
 
 - (NSURL *)findUrlForPath:(NSString *)path {
@@ -121,6 +149,8 @@ RCT_EXPORT_METHOD(prepare:(nonnull NSNumber*)playerId
                                                  name:AVPlayerItemDidPlayToEndTimeNotification
                                                object:item];
     
+
+    
     // Set audio session
     NSError *error = nil;
     [[AVAudioSession sharedInstance] setCategory: AVAudioSessionCategoryPlayback error: &error];
@@ -144,6 +174,9 @@ RCT_EXPORT_METHOD(prepare:(nonnull NSNumber*)playerId
         }
 
         [[self playerPool] setObject:player forKey:playerId];
+        [self setLastPlayerId:playerId];
+    
+        
     } else {
         NSString *errMsg = [NSString stringWithFormat:@"Could not initialize player, error: %@", error];
         NSDictionary* dict = [Helpers errObjWithCode:@"preparefail"
@@ -152,14 +185,33 @@ RCT_EXPORT_METHOD(prepare:(nonnull NSNumber*)playerId
         return;
     }
     
+    
+    
     // Prepare the player
     // Wait until player is ready
-    while (player.status == AVPlayerStatusUnknown) {
+    while (player.currentItem.status == AVPlayerStatusUnknown) {
+        [NSThread sleepForTimeInterval:0.01f];
+    }
+    
+    //make sure loadedTimeRanges is not null
+    while (player.currentItem.loadedTimeRanges.firstObject == nil){
+        [NSThread sleepForTimeInterval:0.01f];
+    }
+    
+    //wait until 10 seconds are buffered then play
+    player.currentItem.preferredForwardBufferDuration = 500;
+    Float64 durationSeconds = 0;
+    while (durationSeconds < 10){
+        NSValue *val = player.currentItem.loadedTimeRanges.firstObject;
+        CMTimeRange timeRange;
+        [val getValue:&timeRange];
+        durationSeconds = CMTimeGetSeconds(timeRange.duration);
         [NSThread sleepForTimeInterval:0.01f];
     }
     
     // Callback when ready / failed
-    if (player.status == AVPlayerStatusReadyToPlay) {
+    if (player.currentItem.status == AVPlayerStatusReadyToPlay) {
+        player.automaticallyWaitsToMinimizeStalling = false;
         callback(@[[NSNull null]]);
     } else {
         NSDictionary* dict = [Helpers errObjWithCode:@"preparefail"
@@ -167,10 +219,10 @@ RCT_EXPORT_METHOD(prepare:(nonnull NSNumber*)playerId
         
         if (player.autoDestroy) {
             [self destroyPlayerWithId:playerId];
-        }
+        }   
         
         callback(@[dict]);
-    }
+    }   
 }
 
 RCT_EXPORT_METHOD(destroy:(nonnull NSNumber*)playerId withCallback:(RCTResponseSenderBlock)callback) {
@@ -276,6 +328,8 @@ RCT_EXPORT_METHOD(stop:(nonnull NSNumber*)playerId withCallback:(RCTResponseSend
 RCT_EXPORT_METHOD(pause:(nonnull NSNumber*)playerId withCallback:(RCTResponseSenderBlock)callback) {
     AVPlayer* player = [self playerForKey:playerId];
     
+    NSLog(@"Hey Ja");
+    
     if (!player) {
         NSDictionary* dict = [Helpers errObjWithCode:@"notfound"
                                          withMessage:[NSString stringWithFormat:@"playerId %@ not found.", playerId]];
@@ -287,6 +341,14 @@ RCT_EXPORT_METHOD(pause:(nonnull NSNumber*)playerId withCallback:(RCTResponseSen
 
     callback(@[[NSNull null], @{@"duration": @(CMTimeGetSeconds(player.currentItem.asset.duration) * 1000),
                                 @"position": @(CMTimeGetSeconds(player.currentTime) * 1000)}]);
+    
+    
+    NSString *eventName = [NSString stringWithFormat:@"RCTAudioPlayerEvent:%@", playerId];
+        [self.bridge.eventDispatcher sendAppEventWithName:eventName
+                                                     body:@{@"event": @"pause",
+                                                            @"data" : @{@"duration": @(CMTimeGetSeconds(player.currentItem.asset.duration) * 1000),
+                                                                        @"position": @(CMTimeGetSeconds(player.currentTime) * 1000)}
+                                                            }];
 }
 
 RCT_EXPORT_METHOD(resume:(nonnull NSNumber*)playerId withCallback:(RCTResponseSenderBlock)callback) {
@@ -306,6 +368,8 @@ RCT_EXPORT_METHOD(resume:(nonnull NSNumber*)playerId withCallback:(RCTResponseSe
 
 
 -(void)itemDidFinishPlaying:(NSNotification *) notification {
+    
+    NSLog(@"GAY");
     NSNumber *playerId = ((ReactPlayerItem *)notification.object).reactPlayerId;
     ReactPlayer *player = (ReactPlayer *)[self playerForKey:playerId];
     if (player.autoDestroy) {
@@ -340,6 +404,40 @@ RCT_EXPORT_METHOD(resume:(nonnull NSNumber*)playerId withCallback:(RCTResponseSe
         [player pause];
         [[self playerPool] removeObjectForKey:playerId];
 
+    }
+}
+
+
+-(void)audioSessionInterruptionNotification:(NSNotification*)notification {
+    
+    
+    
+    //Check the type of notification, especially if you are sending multiple AVAudioSession events here
+    NSLog(@"Interruption notification name %@", notification.name);
+    
+    if ([notification.name isEqualToString:AVAudioSessionInterruptionNotification]) {
+    
+        NSNumber* lastPlayerId = [self getLastPlayerId];
+        ReactPlayer* player = (ReactPlayer *)[self playerForKey:lastPlayerId];
+        
+        //Check to see if it was a Begin interruption
+        if ([[notification.userInfo valueForKey:AVAudioSessionInterruptionTypeKey] isEqualToNumber:[NSNumber numberWithInt:AVAudioSessionInterruptionTypeBegan]]) {
+            // Stop audio
+        
+            NSString *eventName = [NSString stringWithFormat:@"RCTAudioPlayerEvent:%@", lastPlayerId];
+            [self.bridge.eventDispatcher sendAppEventWithName:eventName
+                                                         body:@{@"event": @"forcePause",
+                                                                @"data" : @{@"duration": @(CMTimeGetSeconds(player.currentItem.asset.duration) * 1000),
+                                                                            @"position": @(CMTimeGetSeconds(player.currentTime) * 1000)}
+                                                                }];
+            
+            NSLog(@"Force pausing audio...");
+            
+        } else if([[notification.userInfo valueForKey:AVAudioSessionInterruptionTypeKey] isEqualToNumber:[NSNumber numberWithInt:AVAudioSessionInterruptionTypeEnded]]){
+            //Resume your audio
+            
+    
+        }
     }
 }
 
